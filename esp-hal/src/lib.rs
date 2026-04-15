@@ -395,7 +395,10 @@ unstable_driver! {
     pub mod trace;
     #[cfg(soc_has_tsens)]
     pub mod tsens;
-    #[cfg(twai_driver_supported)]
+    #[cfg(all(twai_driver_supported, not(esp32c5)))]
+    pub mod twai;
+    #[cfg(all(twai_driver_supported, esp32c5))]
+    #[path = "twai/mod_v2.rs"]
     pub mod twai;
     #[cfg(usb_serial_jtag_driver_supported)]
     pub mod usb_serial_jtag;
