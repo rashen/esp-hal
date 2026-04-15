@@ -104,7 +104,7 @@ For help getting started with this HAL, please refer to [The Rust on ESP Book] a
 | Temperature sensor        | ⚒️   | ⚒️      | ⚒️      | [❌][5153] [^1] | ⚒️      |           | ⚒️      | ⚒️      | ⚒️      |
 | Timers                    | ⚒️   | ⚒️      | ⚒️      | ⚒️      | ⚒️      | ⚒️       | ⚒️      | ⚒️      | ⚒️      |
 | Touch                     | ⚒️   |          |          | [❌][5164] [^1] |          |           |          | [❌][1905] [^1] | [❌][1905] [^1] |
-| TWAI / CAN / CANFD        | ⚒️   |          | ⚒️      | [❌][5163] [^1] | ⚒️      |           | ⚒️      | ⚒️      | ⚒️      |
+| TWAI / CAN / CANFD        | ⚒️   |          | ⚒️      | [⚒️][5163] [^1] | ⚒️      |           | ⚒️      | ⚒️      | ⚒️      |
 | UART                      | ✔️   | ✔️      | ✔️      | ✔️      | ✔️      | ✔️       | ✔️      | ✔️      | ✔️      |
 | UHCI                      | ❌    |          | ⚒️      | ⚒️      | ⚒️      |           | ⚒️      | ❌       | ⚒️      |
 | ULP (FSM)                 | ⚒️   |          |          |          |          |           |          | ⚒️      | ⚒️      |
