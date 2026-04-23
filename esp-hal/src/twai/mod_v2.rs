@@ -246,6 +246,30 @@ pub struct TwaiMode {
     pub loopback: bool,
 }
 
+impl TwaiMode {
+    const fn normal() -> Self {
+        Self {
+            self_test: false,
+            listen_only: false,
+            loopback: false,
+        }
+    }
+    const fn self_test() -> Self {
+        Self {
+            self_test: true,
+            listen_only: false,
+            loopback: false,
+        }
+    }
+    const fn listen_only() -> Self {
+        Self {
+            self_test: false,
+            listen_only: true,
+            loopback: false,
+        }
+    }
+}
+
 /// Standard 11-bit TWAI Identifier (`0..=0x7FF`).
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -1533,7 +1557,7 @@ mod asynch {
                     3
                 } else {
                     // No buffer is empty
-                    return Poll::Pending;
+                    return Poll::Ready(Err(EspTwaiError::BusOff));
                 };
 
                 write_frame(self.twai.register_block(), self.frame, buffer_idx);
