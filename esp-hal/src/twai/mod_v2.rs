@@ -1647,11 +1647,16 @@ mod asynch {
     pub(super) fn handle_interrupt(register_block: &RegisterBlock, async_state: &TwaiAsyncState) {
         let intr_status = register_block.int_stat().read();
 
-        if intr_status.ewli_int_st().bit_is_set()
-            | intr_status.ali_int_st().bit_is_set()
-            | intr_status.doi_int_st().bit_is_set()
-        {
+        if intr_status.ewli_int_st().bit_is_set() | intr_status.ali_int_st().bit_is_set() {
             async_state.err_waker.wake();
+        }
+
+        if intr_status.doi_int_st().bit_is_set() {
+            // DOI_INT_ST must be manually cleared to avoid being set again
+            async_state.err_waker.wake();
+            register_block
+                .int_stat()
+                .modify(|_, w| w.doi_int_st().clear_bit());
         }
 
         if intr_status.bsi_int_st().bit_is_set() {
@@ -1667,7 +1672,7 @@ mod asynch {
                 Ok(frame) => {
                     let _ = async_state.rx_queue.try_send(Ok(frame));
                 }
-                Err(e) => warn!("Error reading frame: {:?}", e),
+                Err(e) => {}
             };
             async_state.rx_waker.wake();
         }
