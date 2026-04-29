@@ -1457,11 +1457,20 @@ mod asynch {
 
     use super::*;
 
+    enum TwaiError {
+        ErrorWarnLimit,
+        ArbitrationLost,
+        DataOverrun,
+        BitRateShifted,
+        FaultConfinementStateChange,
+    }
+
     pub struct TwaiAsyncState {
         pub tx_waker: AtomicWaker,
         pub err_waker: AtomicWaker,
         pub rx_waker: AtomicWaker,
         pub rx_queue: Channel<RawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
+        pub err_queue: Channel<RawMutex, TwaiError, 16>,
     }
 
     impl Default for TwaiAsyncState {
@@ -1477,6 +1486,7 @@ mod asynch {
                 err_waker: AtomicWaker::new(),
                 rx_waker: AtomicWaker::new(),
                 rx_queue: Channel::new(),
+                err_queue: Channel::new(),
             }
         }
     }
@@ -1629,13 +1639,37 @@ mod asynch {
                 self.twai.async_state().err_waker.register(cx.waker());
                 self.twai.async_state().rx_waker.register(cx.waker());
 
-                if let Ok(result) = self.twai.async_state().rx_queue.try_receive() {
-                    return Poll::Ready(result);
-                }
-
                 // Check that the peripheral is not in a bus off state.
                 if self.regs().mode_settings().read().ena().bit_is_clear() {
                     return Poll::Ready(Err(EspTwaiError::BusOff));
+                }
+
+                // Handle incoming errors
+                while let Ok(err) = self.twai.async_state().err_queue.try_receive() {
+                    match err {
+                        TwaiError::ErrorWarnLimit => warn!("Error warning limit reached"),
+                        TwaiError::ArbitrationLost => {
+                            // TODO: This is an error related to transmitting, not receiving
+                            warn!("Arbitration lost");
+                        }
+                        TwaiError::DataOverrun => {
+                            warn!("Data overrun in RX buffer");
+                            // Clear data overrun flag
+                            self.twai
+                                .register_block()
+                                .command()
+                                .write(|w| w.cdo().set_bit());
+                        }
+                        TwaiError::BitRateShifted => warn!("Bit rate shifted"),
+                        TwaiError::FaultConfinementStateChange => {
+                            warn!("Fault confinement changed")
+                        }
+                    };
+                }
+
+                // Handle incoming messages
+                if let Ok(result) = self.twai.async_state().rx_queue.try_receive() {
+                    return Poll::Ready(result);
                 }
 
                 Poll::Pending
@@ -1647,20 +1681,35 @@ mod asynch {
     pub(super) fn handle_interrupt(register_block: &RegisterBlock, async_state: &TwaiAsyncState) {
         let intr_status = register_block.int_stat().read();
 
-        if intr_status.ewli_int_st().bit_is_set() | intr_status.ali_int_st().bit_is_set() {
+        if intr_status.ewli_int_st().bit_is_set() {
+            async_state.err_queue.try_send(TwaiError::ErrorWarnLimit);
+            async_state.err_waker.wake();
+        }
+
+        if intr_status.ali_int_st().bit_is_set() {
+            async_state.err_queue.try_send(TwaiError::ArbitrationLost);
             async_state.err_waker.wake();
         }
 
         if intr_status.doi_int_st().bit_is_set() {
-            // DOI_INT_ST must be manually cleared to avoid being set again
+            async_state.err_queue.try_send(TwaiError::DataOverrun);
             async_state.err_waker.wake();
+            // DOI_INT_ST must be manually cleared to avoid being set again
             register_block
                 .int_stat()
                 .modify(|_, w| w.doi_int_st().clear_bit());
         }
 
         if intr_status.bsi_int_st().bit_is_set() {
-            // TODO: Switch data rate
+            async_state.err_queue.try_send(TwaiError::BitRateShifted);
+            async_state.err_waker.wake();
+        }
+
+        if intr_status.fcsi_int_st().bit_is_set() {
+            async_state
+                .err_queue
+                .try_send(TwaiError::FaultConfinementStateChange);
+            async_state.err_waker.wake();
         }
 
         if intr_status.rxi_int_st().bit_is_set() {
@@ -1677,7 +1726,6 @@ mod asynch {
             async_state.rx_waker.wake();
         }
 
-        // async_state.tx_waker.wake();
         if intr_status.txi_int_st().bit_is_set() || intr_status.txbhci_int_st().bit_is_set() {
             async_state.tx_waker.wake();
         }
