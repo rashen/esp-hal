@@ -678,11 +678,6 @@ where
             .twai0_func_clk_conf()
             .modify(|_, w| w.twai0_func_clk_en().set_bit());
 
-        // Wait for ready
-        while PCR::regs().twai0_conf().read().twai0_ready().bit_is_clear() {
-            core::hint::spin_loop();
-        }
-
         let rx_pin = rx_pin.into();
         let tx_pin = tx_pin.into();
 
@@ -700,9 +695,14 @@ where
         let retransmission_limit = 0;
         let drop_rtr_frames = true;
 
+        // Reset and wait for ready
+        this.regs().mode_settings().write(|w| w.rst().set_bit());
+        while PCR::regs().twai0_conf().read().twai0_ready().bit_is_clear() {
+            core::hint::spin_loop();
+        }
+
         this.regs().mode_settings().write(|w| {
             w.ena().clear_bit(); // Disable
-            w.rst().set_bit(); // Reset
             w.rtrle().bit(retransmission_limit > 0); // Retransmission
             unsafe { w.rtrth().bits(retransmission_limit) };
             w.fdrf().bit(drop_rtr_frames); // Drop RTR frames
@@ -712,6 +712,8 @@ where
             w.rxbam().set_bit(); // Enable RX FIFO automatic increase
             w
         });
+
+        this.set_mode(mode);
 
         this.regs().rx_status_rx_settings().write(|w| {
             w.rtsop().clear_bit(); // Set sample point for timestamp
@@ -836,7 +838,6 @@ where
     /// reception of packets using the new object.
     pub fn start(self) -> Twai<'d, Dm> {
         // self.apply_filter();
-        self.set_mode(self.mode);
 
         // Put the peripheral into operation mode by setting the ena register
         self.regs().mode_settings().modify(|_, w| {
@@ -1463,6 +1464,7 @@ mod asynch {
         DataOverrun,
         BitRateShifted,
         FaultConfinementStateChange,
+        DataReadError,
     }
 
     pub struct TwaiAsyncState {
@@ -1664,6 +1666,9 @@ mod asynch {
                         TwaiError::FaultConfinementStateChange => {
                             warn!("Fault confinement changed")
                         }
+                        TwaiError::DataReadError => {
+                            warn!("Failed reading TWAI frame")
+                        }
                     };
                 }
 
@@ -1682,17 +1687,17 @@ mod asynch {
         let intr_status = register_block.int_stat().read();
 
         if intr_status.ewli_int_st().bit_is_set() {
-            async_state.err_queue.try_send(TwaiError::ErrorWarnLimit);
+            let _ = async_state.err_queue.try_send(TwaiError::ErrorWarnLimit);
             async_state.err_waker.wake();
         }
 
         if intr_status.ali_int_st().bit_is_set() {
-            async_state.err_queue.try_send(TwaiError::ArbitrationLost);
+            let _ = async_state.err_queue.try_send(TwaiError::ArbitrationLost);
             async_state.err_waker.wake();
         }
 
         if intr_status.doi_int_st().bit_is_set() {
-            async_state.err_queue.try_send(TwaiError::DataOverrun);
+            let _ = async_state.err_queue.try_send(TwaiError::DataOverrun);
             async_state.err_waker.wake();
             // DOI_INT_ST must be manually cleared to avoid being set again
             register_block
@@ -1701,12 +1706,12 @@ mod asynch {
         }
 
         if intr_status.bsi_int_st().bit_is_set() {
-            async_state.err_queue.try_send(TwaiError::BitRateShifted);
+            let _ = async_state.err_queue.try_send(TwaiError::BitRateShifted);
             async_state.err_waker.wake();
         }
 
         if intr_status.fcsi_int_st().bit_is_set() {
-            async_state
+            let _ = async_state
                 .err_queue
                 .try_send(TwaiError::FaultConfinementStateChange);
             async_state.err_waker.wake();
@@ -1721,7 +1726,10 @@ mod asynch {
                 Ok(frame) => {
                     let _ = async_state.rx_queue.try_send(Ok(frame));
                 }
-                Err(e) => {}
+                Err(e) => {
+                    let _ = async_state.err_queue.try_send(TwaiError::DataReadError);
+                    async_state.err_waker.wake();
+                }
             };
             async_state.rx_waker.wake();
         }
