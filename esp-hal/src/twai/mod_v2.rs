@@ -1563,9 +1563,9 @@ mod asynch {
                     0
                 } else if tx_status.tx2s().bits() >= OK {
                     1
-                } else if tx_status.tx2s().bits() >= OK {
+                } else if tx_status.tx3s().bits() >= OK {
                     2
-                } else if tx_status.tx2s().bits() >= OK {
+                } else if tx_status.tx4s().bits() >= OK {
                     3
                 } else {
                     // No buffer is empty
