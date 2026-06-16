@@ -653,7 +653,7 @@ where
                 w.wdt_stg3().bits(MwdtStageAction::Off as u8)
             });
 
-            #[cfg(any(esp32c2, esp32c3, esp32c6))]
+            #[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6))]
             reg_block
                 .wdtconfig0()
                 .modify(|_, w| w.wdt_conf_update_en().set_bit());
@@ -733,7 +733,7 @@ where
 
         config_register.write(|w| unsafe { w.hold().bits(timeout) });
 
-        #[cfg(any(esp32c2, esp32c3, esp32c6))]
+        #[cfg(any(esp32c2, esp32c3, esp32c5, esp32c6))]
         reg_block
             .wdtconfig0()
             .modify(|_, w| w.wdt_conf_update_en().set_bit());
