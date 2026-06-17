@@ -1576,7 +1576,7 @@ mod asynch {
                 self.in_flight = Some(buffer_idx);
             }
 
-            if let Some(buffer_idx) = &self.in_flight {
+            if let Some(buffer_idx) = self.in_flight {
                 let tx_status = self.twai.register_block().tx_status().read();
                 let tx_buffer_status = match buffer_idx {
                     0 => tx_status.txtb0_state().bits(),
@@ -1586,12 +1586,22 @@ mod asynch {
                     _ => panic!("Illegal buffer"),
                 };
 
-                return match tx_buffer_status {
+                let result = match tx_buffer_status {
                     ERROR | ABORTED | EMPTY | NOT_EXIST => Poll::Ready(Err(EspTwaiError::BusOff)),
                     READY | TRANSMITTING | ABORT_IN_PROGRESS => Poll::Pending,
                     OK => Poll::Ready(Ok(())),
                     _ => unreachable!(),
                 };
+
+                // Once the transfer reaches a terminal state there is nothing left to
+                // abort, so clear `in_flight` to prevent the `Drop` implementation from
+                // issuing a spurious abort command on a buffer that may be reused by the
+                // next transmission.
+                if result.is_ready() {
+                    self.in_flight = None;
+                }
+
+                return result;
             }
 
             Poll::Pending
@@ -1699,10 +1709,6 @@ mod asynch {
         if intr_status.doi_int_st().bit_is_set() {
             let _ = async_state.err_queue.try_send(TwaiError::DataOverrun);
             async_state.err_waker.wake();
-            // DOI_INT_ST must be manually cleared to avoid being set again
-            register_block
-                .int_stat()
-                .modify(|_, w| w.doi_int_st().clear_bit());
         }
 
         if intr_status.bsi_int_st().bit_is_set() {
@@ -1738,8 +1744,13 @@ mod asynch {
             async_state.tx_waker.wake();
         }
 
+        // Acknowledge the handled interrupts by writing `1` to the corresponding
+        // status bits (`int_stat` is write-1-to-clear). We must NOT disable the
+        // interrupt enables here: doing so would mean the next transmission never
+        // raises its completion interrupt, leaving the transmit future waiting
+        // forever (a lost wakeup).
         register_block
-            .int_ena_clr()
+            .int_stat()
             .write(|w| unsafe { w.bits(intr_status.bits()) });
     }
 }
