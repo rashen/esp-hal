@@ -381,7 +381,7 @@ where
 
             // see https://github.com/espressif/esp-idf/blob/b4268c874a4cf8fcf7c0c4153cffb76ad2ddda4e/components/hal/adc_oneshot_hal.c#L105-L107
             // the delay might be a bit generous but longer delay seem to not cause problems
-            #[cfg(esp32c6)]
+            #[cfg(any(esp32c5, esp32c6))]
             {
                 crate::rom::ets_delay_us(40);
                 ADCX::start_onetime_sample();
