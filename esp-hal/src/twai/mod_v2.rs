@@ -129,9 +129,16 @@ use procmacros::handler;
 
 use self::filter::{Filter, FilterType};
 use crate::{
-    Async, Blocking, DriverMode,
+    Async,
+    Blocking,
+    DriverMode,
     gpio::{
-        DriveMode, InputConfig, InputSignal, OutputConfig, OutputSignal, Pull,
+        DriveMode,
+        InputConfig,
+        InputSignal,
+        OutputConfig,
+        OutputSignal,
+        Pull,
         interconnect::{PeripheralInput, PeripheralOutput},
     },
     interrupt::InterruptHandler,
