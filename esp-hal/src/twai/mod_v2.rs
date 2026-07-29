@@ -1669,7 +1669,7 @@ mod asynch {
                         TwaiError::ErrorWarnLimit => warn!("Error warning limit reached"),
                         TwaiError::ArbitrationLost => {
                             // TODO: This is an error related to transmitting, not receiving
-                            warn!("Arbitration lost");
+                            debug!("Arbitration lost");
                         }
                         TwaiError::DataOverrun => {
                             warn!("Data overrun in RX buffer");
