@@ -99,7 +99,11 @@ unsafe fn realloc_with_caps(
     caps: enumset::EnumSet<crate::MemoryCapability>,
 ) -> *mut u8 {
     unsafe extern "C" {
-        fn memcpy(d: *mut u8, s: *const u8, l: usize);
+        fn memcpy(
+            d: *mut core::ffi::c_void,
+            s: *const core::ffi::c_void,
+            l: usize,
+        ) -> *mut core::ffi::c_void;
     }
 
     unsafe {
@@ -109,7 +113,11 @@ unsafe fn realloc_with_caps(
                 (ptr as *const u32).sub(1).read_volatile() as usize,
                 new_size,
             );
-            memcpy(p, ptr, len);
+            memcpy(
+                p as *mut core::ffi::c_void,
+                ptr as *const core::ffi::c_void,
+                len,
+            );
             free(ptr);
         }
         p
