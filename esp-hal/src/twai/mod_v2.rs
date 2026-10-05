@@ -699,7 +699,8 @@ where
             _guard: guard,
         };
 
-        let retransmission_limit = 0;
+        // Mirror retransmission limit from esp-idf
+        const RETRANSMISSION_LIMIT: u8 = 3;
         let drop_rtr_frames = true;
 
         // Reset and wait for ready
@@ -710,8 +711,8 @@ where
 
         this.regs().mode_settings().write(|w| {
             w.ena().clear_bit(); // Disable
-            w.rtrle().bit(retransmission_limit > 0); // Retransmission
-            unsafe { w.rtrth().bits(retransmission_limit) };
+            w.rtrle().set_bit(); // Enable the retransmission limit
+            unsafe { w.rtrth().bits(RETRANSMISSION_LIMIT) };
             w.fdrf().bit(drop_rtr_frames); // Drop RTR frames
             w.afm().set_bit(); // Enable filter mode
             w.fde().set_bit(); // Flexible bit rate between nominal and data field
@@ -734,6 +735,7 @@ where
             w.ali_int_ena_mask().set_bit();
             w.doi_int_ena_mask().set_bit();
             w.bsi_int_ena_mask().set_bit();
+            w.fcsi_int_ena_mask().set_bit();
             w.txbhci_int_ena_mask().set_bit();
             w
         });
@@ -1017,7 +1019,7 @@ where
 
     /// Check if the controller is in a bus off state.
     pub fn is_bus_off(&self) -> bool {
-        self.regs().mode_settings().read().ena().bit_is_clear()
+        is_bus_off(self.regs())
     }
 
     /// Get the number of messages that the peripheral has available in the
@@ -1065,7 +1067,6 @@ impl<Dm> TwaiTx<'_, Dm>
 where
     Dm: DriverMode,
 {
-    #[allow(unused)] // Unused while transmit is not implemented
     fn regs(&self) -> &RegisterBlock {
         self.twai.register_block()
     }
@@ -1135,6 +1136,12 @@ pub enum TwaiInterrupt {
 pub enum EspTwaiError {
     /// TWAI peripheral has entered a bus-off state.
     BusOff,
+    /// The transmit path found no free TX buffer to queue the frame in.
+    NoFreeTxBuffer,
+    /// The controller gave up on a queued frame
+    TransmitFailed,
+    /// A queued transmission was aborted.
+    TransmitAborted,
     /// The received frame contains an invalid DLC.
     NonCompliantDlc(u8),
     /// Encapsulates errors defined by the embedded-hal crate.
@@ -1222,6 +1229,87 @@ pub trait PrivateInstance: crate::private::Sealed {
     }
     /// Returns a reference to the asynchronous state for this TWAI instance.
     fn async_state(&self) -> &asynch::TwaiAsyncState;
+}
+
+/// Returns whether the controller has left the bus after its transmit error
+/// counter exceeded 255 (ISO 11898-1 fault confinement).
+fn is_bus_off(register_block: &RegisterBlock) -> bool {
+    register_block
+        .ewl_erp_fault_state()
+        .read()
+        .bof()
+        .bit_is_set()
+}
+
+fn request_bus_off_recovery(register_block: &RegisterBlock) {
+    register_block.command().write(|w| w.ercrst().set_bit());
+}
+
+/// Logs the controller's fault confinement state, the last captured bus
+/// error, and the error counters. Called from contexts that already know an
+/// error occurred (error warning limit, fault confinement change, bus error,
+/// or arbitration lost), so this does not gate on anything itself.
+fn log_error_state(register_block: &RegisterBlock) {
+    let fault_state = register_block.ewl_erp_fault_state().read();
+    let state = if fault_state.bof().bit_is_set() {
+        "bus-off"
+    } else if fault_state.erp().bit_is_set() {
+        "error-passive"
+    } else {
+        "error-active"
+    };
+
+    let err_capt = register_block.err_capt_retr_ctr_alc_ts_info().read();
+    let err_type = match err_capt.err_type().bits() {
+        0b000 => "bit",
+        0b001 => "crc",
+        0b010 => "form",
+        0b011 => "acknowledge",
+        0b100 => "stuff",
+        _ => "unknown",
+    };
+    let err_pos = match err_capt.err_pos().bits() {
+        0b00000 => "start-of-frame",
+        0b00001 => "arbitration",
+        0b00010 => "control",
+        0b00011 => "data",
+        0b00100 => "crc",
+        0b00101 => "ack",
+        0b00110 => "end-of-frame",
+        0b00111 => "error-frame",
+        0b01000 => "overload-frame",
+        _ => "other",
+    };
+
+    let rec_tec = register_block.rec_tec().read();
+
+    warn!(
+        "CAN fault state: {} last_error={}@{} retransmits={} rec={} tec={}",
+        state,
+        err_type,
+        err_pos,
+        err_capt.retr_ctr_val().bits(),
+        rec_tec.rec_val().bits(),
+        rec_tec.tec_val().bits(),
+    );
+}
+
+/// Counts calls made through [`log_bus_error_rate_limited`], shared by every
+/// controller instance.
+static BUS_ERROR_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Calls [`log_error_state`], backing off as errors keep recurring.
+///
+/// A node contending with another for the same identifier, or a bus stuck in
+/// a fault loop, can raise one of these interrupts every frame; logging every
+/// occurrence would itself stall the system. The first 8 occurrences are
+/// logged in full, then only every occurrence whose count is a power of two,
+/// so the log still shows the fault is ongoing without flooding it.
+fn log_bus_error_rate_limited(register_block: &RegisterBlock) {
+    let count = BUS_ERROR_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count < 8 || (count + 1).is_power_of_two() {
+        log_error_state(register_block);
+    }
 }
 
 fn read_frame(register_block: &RegisterBlock) -> Result<EspTwaiFrame, EspTwaiError> {
@@ -1471,6 +1559,7 @@ mod asynch {
         DataOverrun,
         BitRateShifted,
         FaultConfinementStateChange,
+        BusError,
         DataReadError,
     }
 
@@ -1552,14 +1641,8 @@ mod asynch {
 
             self.twai.async_state().tx_waker.register(cx.waker());
 
-            if self
-                .twai
-                .register_block()
-                .mode_settings()
-                .read()
-                .ena()
-                .bit_is_clear()
-            {
+            if is_bus_off(self.twai.register_block()) {
+                request_bus_off_recovery(self.twai.register_block());
                 return Poll::Ready(Err(EspTwaiError::BusOff));
             }
 
@@ -1576,7 +1659,7 @@ mod asynch {
                     3
                 } else {
                     // No buffer is empty
-                    return Poll::Ready(Err(EspTwaiError::BusOff));
+                    return Poll::Ready(Err(EspTwaiError::NoFreeTxBuffer));
                 };
 
                 write_frame(self.twai.register_block(), self.frame, buffer_idx);
@@ -1594,7 +1677,11 @@ mod asynch {
                 };
 
                 let result = match tx_buffer_status {
-                    ERROR | ABORTED | EMPTY | NOT_EXIST => Poll::Ready(Err(EspTwaiError::BusOff)),
+                    // The controller gave up on the frame, for example because the
+                    // retransmission limit was reached
+                    ERROR => Poll::Ready(Err(EspTwaiError::TransmitFailed)),
+                    ABORTED => Poll::Ready(Err(EspTwaiError::TransmitAborted)),
+                    EMPTY | NOT_EXIST => Poll::Ready(Err(EspTwaiError::NoFreeTxBuffer)),
                     READY | TRANSMITTING | ABORT_IN_PROGRESS => Poll::Pending,
                     OK => Poll::Ready(Ok(())),
                     _ => unreachable!(),
@@ -1659,7 +1746,8 @@ mod asynch {
                 self.twai.async_state().rx_waker.register(cx.waker());
 
                 // Check that the peripheral is not in a bus off state.
-                if self.regs().mode_settings().read().ena().bit_is_clear() {
+                if is_bus_off(self.regs()) {
+                    request_bus_off_recovery(self.regs());
                     return Poll::Ready(Err(EspTwaiError::BusOff));
                 }
 
@@ -1680,12 +1768,10 @@ mod asynch {
                                 .write(|w| w.cdo().set_bit());
                         }
                         TwaiError::BitRateShifted => warn!("Bit rate shifted"),
-                        TwaiError::FaultConfinementStateChange => {
-                            warn!("Fault confinement changed")
-                        }
                         TwaiError::DataReadError => {
                             warn!("Failed reading TWAI frame")
                         }
+                        _ => {}
                     };
                 }
 
@@ -1705,11 +1791,13 @@ mod asynch {
 
         if intr_status.ewli_int_st().bit_is_set() {
             let _ = async_state.err_queue.try_send(TwaiError::ErrorWarnLimit);
+            log_bus_error_rate_limited(register_block);
             async_state.err_waker.wake();
         }
 
         if intr_status.ali_int_st().bit_is_set() {
             let _ = async_state.err_queue.try_send(TwaiError::ArbitrationLost);
+            log_bus_error_rate_limited(register_block);
             async_state.err_waker.wake();
         }
 
@@ -1723,15 +1811,25 @@ mod asynch {
             async_state.err_waker.wake();
         }
 
+        if intr_status.bei_int_st().bit_is_set() {
+            let _ = async_state.err_queue.try_send(TwaiError::BusError);
+            log_bus_error_rate_limited(register_block);
+            async_state.err_waker.wake();
+        }
+
         if intr_status.fcsi_int_st().bit_is_set() {
             let _ = async_state
                 .err_queue
                 .try_send(TwaiError::FaultConfinementStateChange);
+            // A fault confinement transition (active -> passive -> bus-off, or back) is
+            // an edge, not a storm, so it is always logged in full.
+            log_error_state(register_block);
             async_state.err_waker.wake();
         }
 
         if intr_status.rxi_int_st().bit_is_set() {
-            if register_block.mode_settings().read().ena().bit_is_clear() {
+            if is_bus_off(register_block) {
+                request_bus_off_recovery(register_block);
                 let _ = async_state.rx_queue.try_send(Err(EspTwaiError::BusOff));
             }
 
