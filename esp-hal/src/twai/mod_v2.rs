@@ -129,9 +129,16 @@ use procmacros::handler;
 
 use self::filter::{Filter, FilterType};
 use crate::{
-    Async, Blocking, DriverMode,
+    Async,
+    Blocking,
+    DriverMode,
     gpio::{
-        DriveMode, InputConfig, InputSignal, OutputConfig, OutputSignal, Pull,
+        DriveMode,
+        InputConfig,
+        InputSignal,
+        OutputConfig,
+        OutputSignal,
+        Pull,
         interconnect::{PeripheralInput, PeripheralOutput},
     },
     interrupt::InterruptHandler,
@@ -1305,34 +1312,54 @@ fn log_bus_error_rate_limited(register_block: &RegisterBlock) {
     }
 }
 
+/// Decodes a CAN data length code into the payload length in bytes.
+///
+/// Codes 0..=8 are the byte count itself. CAN FD reuses codes 9..=15 for the
+/// larger payloads below; they are not a byte count and must not be used as
+/// one, because the number of words the frame occupies in the receive buffer
+/// is derived from the decoded length.
+const fn decode_dlc(dlc: u8) -> usize {
+    match dlc {
+        0..=8 => dlc as usize,
+        9 => 12,
+        10 => 16,
+        11 => 20,
+        12 => 24,
+        13 => 32,
+        14 => 48,
+        _ => 64,
+    }
+}
+
+/// Reads one frame from the receive buffer, always leaving the read pointer on
+/// a frame boundary.
+///
+/// Every exit path releases the remainder of the frame. Leaving the pointer in
+/// the middle of a frame is unrecoverable from the driver's point of view: the
+/// frame count never decrements, so `STATUS[RXNE]` stays set, the buffer fills
+/// and overruns, and the resulting `DOI`/`RBNEI` conditions re-assert as fast
+/// as the handler acknowledges them.
 fn read_frame(register_block: &RegisterBlock) -> Result<EspTwaiFrame, EspTwaiError> {
-    // Ensure that we are at the start of a frame. If not there has likely been an overrun.
+    // Resynchronise to a frame boundary in case an earlier read left the
+    // pointer mid-frame.
+    release_receive_fifo(register_block);
+
     if register_block
         .rx_status_rx_settings()
         .read()
-        .rxmof()
-        .bit_is_clear()
+        .rxe()
+        .bit_is_set()
     {
-        release_receive_fifo(register_block);
-        if register_block
-            .rx_status_rx_settings()
-            .read()
-            .rxe()
-            .bit_is_set()
-        {
-            return Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun));
-        }
+        return Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun));
     }
 
-    let frame_format = register_block.rx_data().read().rx_data().bits();
+    let frame_format = register_block.rx_data().read().bits();
 
-    let is_standard_format = frame_format & (0b1 << 6) == 0;
+    let is_standard_format = frame_format & (1 << 6) == 0;
+    let is_remote = frame_format & (1 << 5) != 0;
+    let is_fd = frame_format & (1 << 7) != 0;
     let dlc = (frame_format & 0b1111) as u8;
-
-    if dlc > 64 {
-        release_receive_fifo(register_block);
-        return Err(EspTwaiError::NonCompliantDlc(dlc));
-    }
+    let len = decode_dlc(dlc);
 
     let id = register_block.rx_data().read().bits();
     let id = if is_standard_format {
@@ -1345,26 +1372,64 @@ fn read_frame(register_block: &RegisterBlock) -> Result<EspTwaiFrame, EspTwaiErr
 
     let _timestamp_low = register_block.rx_data().read();
     let _timestamp_high = register_block.rx_data().read();
-    let mut buffer: [u8; 64] = [0; _];
-    // 4 because u32 is 4 u8s
-    for i in 0..(dlc.div_ceil(4)) as usize {
-        let start = i * 4;
-        let end = start + 4;
-        buffer[start..end].copy_from_slice(&register_block.rx_data().read().bits().to_le_bytes());
+
+    // An `EspTwaiFrame` holds a classic CAN payload, so an FD frame cannot be
+    // represented. Report it rather than truncating, but still consume it.
+    if is_fd || len > 8 {
+        release_receive_fifo(register_block);
+        return Err(EspTwaiError::NonCompliantDlc(dlc));
     }
 
-    let mut frame = EspTwaiFrame::new(id, &buffer[..dlc as usize]).expect("Data length exceeded");
+    // A remote frame carries a data length code but no data words. Reading
+    // `len` bytes anyway would consume the next frame's header.
+    let frame = if is_remote {
+        EspTwaiFrame::new_remote(id, len)
+    } else {
+        let mut buffer = [0u8; 8];
+        // 4 because u32 is 4 u8s
+        for chunk in buffer[..len].chunks_mut(4) {
+            let word = register_block.rx_data().read().bits().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        EspTwaiFrame::new(id, &buffer[..len])
+    };
 
+    // Drop any padding the controller stored beyond the decoded payload and
+    // advance to the next frame.
+    release_receive_fifo(register_block);
+
+    let mut frame = frame.ok_or(EspTwaiError::NonCompliantDlc(dlc))?;
     frame.self_reception = false;
 
     Ok(frame)
 }
 
+/// The largest number of words a single frame can occupy in the receive
+/// buffer: a four word header plus a 64 byte CAN FD payload.
+const MAX_FRAME_WORDS: usize = 4 + 64 / 4;
+
+/// An upper bound on the number of frames the receive buffer can hold, used
+/// to bound the drain loop that runs in interrupt context. The buffer is at
+/// most 128 words and the smallest frame occupies the four header words.
+const MAX_RX_FRAMES: usize = 128 / 4;
+
 /// Release the message in the buffer. This will decrement the received
 /// message counter and prepare the next message in the FIFO for
 /// reading.
+///
+/// `RXMOF` reports that the next read would return something other than a
+/// frame header, so discarding words until it clears lands the read pointer on
+/// the next frame. The loop is bounded because it runs in interrupt context.
 fn release_receive_fifo(register_block: &RegisterBlock) {
-    while register_block.rx_status_rx_settings().read().rxmof().bit() {
+    for _ in 0..MAX_FRAME_WORDS {
+        if register_block
+            .rx_status_rx_settings()
+            .read()
+            .rxmof()
+            .bit_is_clear()
+        {
+            return;
+        }
         // Flush the incoming message buffer until we reach the start of a new frame
         let _ = register_block.rx_data().read();
     }
@@ -1820,22 +1885,54 @@ mod asynch {
             async_state.err_waker.wake();
         }
 
-        if intr_status.rxi_int_st().bit_is_set() {
-            if is_bus_off(register_block) {
-                request_bus_off_recovery(register_block);
-                let _ = async_state.rx_queue.try_send(Err(EspTwaiError::BusOff));
+        if intr_status.rxi_int_st().bit_is_set() && is_bus_off(register_block) {
+            request_bus_off_recovery(register_block);
+            let _ = async_state.rx_queue.try_send(Err(EspTwaiError::BusOff));
+            async_state.rx_waker.wake();
+        }
+
+        // Drain the receive buffer instead of reading a single frame per
+        // `RXI`. `RXI` is raised when a frame is stored, so it is an edge: once
+        // the buffer is full no further frames can be stored and no further
+        // edge arrives, and anything still queued would stay there forever
+        // while `STATUS[RXNE]` keeps the overrun condition alive. Draining on
+        // the buffer's own state recovers from that without needing an edge,
+        // and draining to empty means there is always room for the next frame.
+        let mut received = false;
+        for _ in 0..MAX_RX_FRAMES {
+            if register_block
+                .rx_status_rx_settings()
+                .read()
+                .rxe()
+                .bit_is_set()
+            {
+                break;
             }
 
             match read_frame(register_block) {
                 Ok(frame) => {
                     let _ = async_state.rx_queue.try_send(Ok(frame));
                 }
-                Err(e) => {
+                Err(_) => {
                     let _ = async_state.err_queue.try_send(TwaiError::DataReadError);
                     async_state.err_waker.wake();
                 }
-            };
+            }
+            received = true;
+        }
+        if received {
             async_state.rx_waker.wake();
+        }
+
+        // Clear the data overrun flag once the buffer has been drained.
+        // `STATUS[DOR]` has to be clear before `DOI` is acknowledged below,
+        // otherwise the overrun condition re-asserts `DOI` immediately and the
+        // handler is re-entered as soon as it returns, starving every task on
+        // the core. Clearing it after the drain rather than before also means
+        // a frame arriving while the buffer was still full does not leave the
+        // flag set behind the acknowledgement.
+        if register_block.status().read().dor().bit_is_set() {
+            register_block.command().write(|w| w.cdo().set_bit());
         }
 
         if intr_status.txi_int_st().bit_is_set() || intr_status.txbhci_int_st().bit_is_set() {
