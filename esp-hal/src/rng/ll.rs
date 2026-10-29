@@ -1,6 +1,8 @@
 use esp_sync::NonReentrantMutex;
 
-use crate::{clock::Clocks, peripherals::RNG};
+use crate::clock::Clocks;
+#[cfg(not(esp32c5))]
+use crate::peripherals::RNG;
 
 // TODO: find a better place for these
 #[inline]
@@ -64,7 +66,13 @@ fn read_one(wait_cycles: usize) -> u32 {
             if now.wrapping_sub(*last_wait_start) >= wait_cycles {
                 *last_wait_start = now;
 
-                Some(RNG::regs().data().read().bits())
+                cfg_if::cfg_if! {
+                    if #[cfg(esp32c5)] {
+                        Some(crate::peripherals::LP_PERI::regs().rng_data_sync().read().bits())
+                    } else {
+                        Some(RNG::regs().data().read().bits())
+                    }
+                }
             } else {
                 None
             }

@@ -296,7 +296,7 @@ macro_rules! property {
         stringify!(16)
     };
     ("rng.trng_supported") => {
-        false
+        true
     };
     ("rsa.size_increment") => {
         32
